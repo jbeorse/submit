@@ -11,6 +11,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.RemoteException;
 import android.support.design.widget.Snackbar;
+import android.support.v4.app.FragmentManager;
 import android.support.v7.widget.LinearLayoutManager;
 import android.support.v7.widget.RecyclerView;
 import android.support.v7.widget.Toolbar;
@@ -20,18 +21,24 @@ import android.widget.Button;
 import android.widget.TextView;
 
 import org.opendatakit.consts.IntentConsts;
+import org.opendatakit.fragment.AlertNProgessMsgFragmentMger;
+import org.opendatakit.logging.WebLogger;
 import org.opendatakit.properties.CommonToolProperties;
 import org.opendatakit.properties.PropertiesSingleton;
 import org.opendatakit.submit.R;
 import org.opendatakit.submit.service.PeerAdapter;
 import org.opendatakit.submit.service.WifiDirectBroadcastReceiver;
 
+import org.opendatakit.submit.service.actions.SyncActions;
 import org.opendatakit.submit.service.peer.PeerSyncServerService;
 import org.opendatakit.submit.service.peer.server.PeerSyncServer;
 import org.opendatakit.submit.util.PeerSyncUtil;
 import org.opendatakit.submit.util.SubmitUtil;
 import org.opendatakit.sync.service.IOdkSyncServiceInterface;
 import org.opendatakit.sync.service.SyncAttachmentState;
+import org.opendatakit.sync.service.SyncProgressEvent;
+import org.opendatakit.sync.service.SyncProgressState;
+import org.opendatakit.sync.service.SyncStatus;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -59,10 +66,18 @@ public class PeerTransferActivity extends SubmitBaseActivity {
 
     private PeerSyncServer server;
 
+    private final Handler handler = new Handler();
+    private AlertNProgessMsgFragmentMger msgManager;
+    private SyncActions syncAction = SyncActions.IDLE;
+
   // this is used for joining table stuff
     private static final String SUFFIX = "_o";
     // tag for logging
     private static final String TAG = "PeerTransferActivity";
+    private String alertDialogTag = TAG + "AlertDialog";
+    private String progressDialogTag = TAG + "ProgressDialog";
+
+    IOdkSyncServiceInterface syncInterface;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -137,6 +152,26 @@ public class PeerTransferActivity extends SubmitBaseActivity {
         // display device id
         TextView yourId = findViewById(R.id.your_id);
         yourId.setText(PeerSyncUtil.getAndroidId(this));
+
+        if (savedInstanceState != null) {
+            msgManager = AlertNProgessMsgFragmentMger
+                    .restoreInitMessaging(SubmitUtil.getSecondaryAppName(getAppName()), alertDialogTag, progressDialogTag,
+                            savedInstanceState);
+        }
+
+        // if message manager was not created from saved state, create fresh
+        if (msgManager == null) {
+            msgManager = new AlertNProgessMsgFragmentMger(SubmitUtil.getSecondaryAppName(getAppName()), alertDialogTag,
+                    progressDialogTag, false, false);
+        }
+    }
+
+    @Override
+    public void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        if (msgManager != null) {
+            msgManager.addStateToSaveStateBundle(outState);
+        }
     }
 
     public void bindToSyncService(String androidId) {
@@ -152,6 +187,7 @@ public class PeerTransferActivity extends SubmitBaseActivity {
                 CommonToolProperties.KEY_SYNC_SERVER_URL,
                 IntentConsts.SubmitPeerSync.URI_SCHEME + androidIdToIp.get(androidId) + ":8080/" + secondaryAppName
         ));
+        Log.e(TAG, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" + IntentConsts.SubmitPeerSync.URI_SCHEME + androidIdToIp.get(androidId) + ":8080/" + secondaryAppName);
         propertiesSingleton.setProperties(Collections.singletonMap(
                 CommonToolProperties.KEY_FIRST_LAUNCH,
                 Boolean.toString(false)
@@ -159,23 +195,35 @@ public class PeerTransferActivity extends SubmitBaseActivity {
 
         Intent intent = new Intent()
                 .setClassName(IntentConsts.Sync.APPLICATION_NAME, IntentConsts.Sync.SYNC_SERVICE_CLASS);
+        syncAction = SyncActions.START_SYNC;
 
         this.bindService(intent, new ServiceConnection() {
-            @Override
-            public void onServiceConnected(ComponentName name, IBinder service) {
-              IOdkSyncServiceInterface syncInterface = IOdkSyncServiceInterface.Stub.asInterface(service);
-                try {
-                  fixSubmitStates();
-                    syncInterface.synchronizeWithServer(secondaryAppName, SyncAttachmentState.NONE);
-                } catch (RemoteException e) {
-                    e.printStackTrace();
-                }
-            }
+          @Override
+          public void onServiceConnected(ComponentName name, IBinder service) {
+            syncInterface = IOdkSyncServiceInterface.Stub.asInterface(service);
+            try {
+              fixSubmitStates();
+              syncInterface.synchronizeWithServer(secondaryAppName, SyncAttachmentState.NONE);
+              syncAction = SyncActions.START_SYNC;
 
-            @Override
-            public void onServiceDisconnected(ComponentName name) {
-                Log.i(TAG, "services disconnected");
+              handler.post(new Runnable() {
+                @Override
+                public void run() {
+                  // TODO: Put strings in xml
+                  msgManager.createProgressDialog("Transferring", "Initiating data transfer", getSupportFragmentManager());
+                }
+              });
+
+              monitorProgress();
+            } catch (RemoteException e) {
+              e.printStackTrace();
             }
+          }
+
+          @Override
+          public void onServiceDisconnected(ComponentName name) {
+            Log.i(TAG, "services disconnected");
+          }
         }, Context.BIND_AUTO_CREATE | Context.BIND_ADJUST_WITH_ACTIVITY);
     }
 
@@ -187,8 +235,6 @@ public class PeerTransferActivity extends SubmitBaseActivity {
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
           Log.e(TAG, "onServiceConnected: connected to PeerSyncServer");
-
-          // TODO: manage server lifecycle better
 
           server = ((PeerSyncServerService.PeerSyncServerBinder) service).getServer();
         }
@@ -263,10 +309,80 @@ public class PeerTransferActivity extends SubmitBaseActivity {
 
     }
 
+  private void monitorProgress() {
+    if (!msgManager.hasDialogBeenCreated()) {
+      // We are in transition. Wait and try again
+      handler.postDelayed(new Runnable() {@Override public void run() { monitorProgress(); }}, 100);
+      return;
+    }
+
+    if (syncInterface == null || syncAction == SyncActions.IDLE) {
+      resetDialogAndStateMachine();
+      return;
+    }
+
+    final SyncStatus status;
+    final SyncProgressEvent event;
+    try {
+      status = syncInterface.getSyncStatus(SubmitUtil.getSecondaryAppName(getAppName()));
+      event = syncInterface.getSyncProgressEvent(SubmitUtil.getSecondaryAppName(getAppName()));
+    } catch (RemoteException e) {
+      // TODO: How can we handle this error? Can we recover?
+      WebLogger.getLogger(SubmitUtil.getSecondaryAppName(getAppName())).d(TAG, "[monitorProgress] Remote exception");
+      e.printStackTrace();
+      resetDialogAndStateMachine();
+      return;
+    }
+
+    if (syncAction == SyncActions.START_SYNC && status == SyncStatus.NONE) {
+      handler.postDelayed(new Runnable() {@Override public void run() { monitorProgress(); }}, 100);
+      return;
+    } else if (status == SyncStatus.SYNCING) {
+      syncAction = SyncActions.MONITOR_SYNCING;
+
+      SyncProgressState progress = (event.progressState != null) ? event.progressState : SyncProgressState.INACTIVE;
+      String message;
+      switch (progress) {
+        case APP_FILES:
+          message = "Copying app files";
+          break;
+        case TABLE_FILES:
+          message = "Copying table files";
+          break;
+        case ROWS:
+          message = "Copying row data";
+          break;
+        default:
+          message = "Copying files";
+      }
+
+      FragmentManager fm =  getSupportFragmentManager();
+      msgManager.createProgressDialog("Copying", message, fm);
+      fm.executePendingTransactions();
+      msgManager.updateProgressDialogMessage(message, event.curProgressBar, event.maxProgressBar, fm);
+
+      handler.postDelayed(new Runnable() {@Override public void run() { monitorProgress(); }}, 100);
+    } else if (syncAction == SyncActions.MONITOR_SYNCING && (status == SyncStatus.SYNC_COMPLETE || status == SyncStatus.NONE)) {
+      FragmentManager fm =  getSupportFragmentManager();
+      msgManager.clearDialogsAndRetainCurrentState(fm);
+      fm.executePendingTransactions();
+      // TODO: Needs a fragment id
+      //msgManager.createAlertDialog("Sync Complete", "The files have been successfully synced", fm);
+      syncAction = SyncActions.IDLE;
+    }
+
+  }
+
+  private void resetDialogAndStateMachine() {
+    msgManager.dismissAlertDialog(getSupportFragmentManager());
+    syncAction = SyncActions.IDLE;
+  }
+
   /* unregister the broadcast receiver */
     @Override
     protected void onPause() {
         super.onPause();
+        msgManager.clearDialogsAndRetainCurrentState(getSupportFragmentManager());
         if (receiverIsRegistered) {
             try {
                 unregisterReceiver(mReceiver);
@@ -276,6 +392,27 @@ public class PeerTransferActivity extends SubmitBaseActivity {
             }
             receiverIsRegistered = false;
         }
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+
+        WebLogger.getLogger(SubmitUtil.getSecondaryAppName(getAppName())).i(TAG, "[onResume]");
+
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                monitorProgress();
+            }
+        }, 100);
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        handler.removeCallbacksAndMessages(null);
+        WebLogger.getLogger(SubmitUtil.getSecondaryAppName(getAppName())).i(TAG, "[onDestroy]");
     }
 
     /**

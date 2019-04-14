@@ -354,6 +354,18 @@ public class TableListFragment extends AbsBaseFragment
       FragmentManager fm =  getFragmentManager();
       msgManager.clearDialogsAndRetainCurrentState(fm);
       fm.executePendingTransactions();
+
+      try {
+        syncInterface.clearAppSynchronizer(SubmitUtil.getSecondaryAppName(getAppName()));
+      } catch (RemoteException e) {
+        // TODO: How can we handle this error? Can we recover?
+        WebLogger.getLogger(SubmitUtil.getSecondaryAppName(getAppName())).d(TAG, "[" + getId() + "] [monitorProgress] Remote exception");
+        e.printStackTrace();
+        resetDialogAndStateMachine();
+        msgManager.createAlertDialog("Copy Error", "An error occurred with the copy", fm, getId());
+        return;
+      }
+
       msgManager.createAlertDialog("Copy Complete", "The files have been successfully copied", fm, getId());
       localSyncBtn.setVisibility(View.GONE);
       launchPeerTransferBtn.setVisibility(View.VISIBLE);
